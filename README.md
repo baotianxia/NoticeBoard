@@ -151,6 +151,9 @@
   "enabled": true,
   "suppress_console_output": true,
   "silence_op_feedback": "auto",
+  "ignore_fake_players": true,
+  "fake_player_prefixes": [],
+  "fake_player_names": [],
   "rotation_mode": "global",
   "refresh_interval": 1.0,
   "skip_empty_targets": true,
@@ -215,6 +218,8 @@
   - `"auto"`：自动检查 `server.properties` 的 `broadcast-console-to-ops`。若为 `true`，则在公告栏运行期间自动将游戏规则 `minecraft:log_admin_commands` 设为 `false`，并在执行 `!!board disable` 或卸载插件时恢复为 `true`；若已设为 `false`，则不做改动。
   - `"always"`：无论 `server.properties` 如何配置，均在公告栏运行期间自动关闭 `minecraft:log_admin_commands`。
   - `"never"`：不修改该游戏规则（若需保留 OP 指令审计日志，推荐在 `server.properties` 中设置 `broadcast-console-to-ops=false` 后重启服务端）。
+- `ignore_fake_players`：是否自动忽略地毯（Carpet Mod）假人（默认 `true`）。开启后假人不会计入 `{online}`、不记录在线时长、也不占用计分栏队伍槽位（包含 `/player ... shadow`）。
+- `fake_player_prefixes` / `fake_player_names`：可选的假人名称前缀或固定名称列表（如 `["bot_"]`），用于匹配在插件首次加载前就已经生成的假人。
 - `rotation_mode`：`"global"`（全服统一轮播）或 `"per_player"`（每人独立轮播）。
 - `refresh_interval`：刷新检查间隔（秒），默认 `1.0`。
 - `skip_empty_targets`：在 `global` 模式下，当某个页面配置的目标玩家当前均不在线时是否自动跳过该页。

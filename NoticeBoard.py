@@ -24,9 +24,9 @@ except ImportError:
 
 PLUGIN_METADATA = {
     'id': 'notice_board',
-    'version': '1.0.2',
+    'version': '1.0.3',
     'name': 'NoticeBoard',
-    'description': 'Vanilla 1.21.11 scoreboard sidebar announcement plugin with rotation, show/hide pages, targeting, colors, placeholders, and LuckPerms support',
+    'description': 'Vanilla 1.21.11 scoreboard sidebar announcement plugin with rotation, show/hide pages, targeting, colors, placeholders, Carpet fake-player filtering, and LuckPerms support',
     'author': 'MCDR',
     'dependencies': {
         'mcdreforged': '>=2.1.0',
@@ -77,6 +77,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'enabled': True,
     'suppress_console_output': True,
     'silence_op_feedback': 'auto',  # 'auto', 'always', 'never'
+    'ignore_fake_players': True,
+    'fake_player_prefixes': [],
+    'fake_player_names': [],
     'rotation_mode': 'global',  # 'global' 或 'per_player'
     'refresh_interval': 1.0,
     'skip_empty_targets': True,
@@ -325,8 +328,9 @@ class PluginState:
         self.sessions_path: str = ''
         self.config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
 
-        # Online & playtime tracking
+        # Online, fake-player & playtime tracking
         self.online_players: Set[str] = set()
+        self.fake_players: Set[str] = set()  # player_lower detected via Carpet [local]
         self.player_sessions: Dict[str, Dict[str, float]] = {}
         self.uuid_cache: Dict[str, str] = {}
         self.self_hidden_players: Set[str] = set()
@@ -421,6 +425,38 @@ class BoardInfoFilter(MCDRInfoFilter):
 
 
 # ============================================================================
+# Fake Player Filtering Helpers
+# ============================================================================
+
+def is_fake_player_locked(player: str) -> bool:
+    if not STATE.config.get('ignore_fake_players', True):
+        return False
+    pl = player.lower()
+    if pl in STATE.fake_players:
+        return True
+    for pref in STATE.config.get('fake_player_prefixes', []):
+        if pref and pl.startswith(pref.lower()):
+            return True
+    for fp in STATE.config.get('fake_player_names', []):
+        if fp and pl == fp.lower():
+            return True
+    return False
+
+
+def purge_fake_players_locked() -> None:
+    if not STATE.config.get('ignore_fake_players', True):
+        return
+    to_remove = [p for p in STATE.online_players if is_fake_player_locked(p)]
+    for p in to_remove:
+        STATE.online_players.discard(p)
+        STATE.player_sessions.pop(p, None)
+        STATE.player_team.pop(p, None)
+        STATE.per_player_rot.pop(p.lower(), None)
+    if to_remove:
+        save_sessions_locked()
+
+
+# ============================================================================
 # Config Normalization, Loading & Saving
 # ============================================================================
 
@@ -480,6 +516,16 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
     cfg['suppress_console_output'] = bool(raw.get('suppress_console_output', cfg['suppress_console_output']))
     sil_op = str(raw.get('silence_op_feedback', cfg['silence_op_feedback'])).strip().lower()
     cfg['silence_op_feedback'] = sil_op if sil_op in ('auto', 'always', 'never') else 'auto'
+    cfg['ignore_fake_players'] = bool(raw.get('ignore_fake_players', cfg['ignore_fake_players']))
+
+    raw_fp_prefixes = raw.get('fake_player_prefixes', cfg['fake_player_prefixes'])
+    if isinstance(raw_fp_prefixes, list):
+        cfg['fake_player_prefixes'] = [str(x).strip() for x in raw_fp_prefixes if str(x).strip()]
+
+    raw_fp_names = raw.get('fake_player_names', cfg['fake_player_names'])
+    if isinstance(raw_fp_names, list):
+        cfg['fake_player_names'] = [str(x).strip() for x in raw_fp_names if str(x).strip()]
+
     rot_mode = str(raw.get('rotation_mode', cfg['rotation_mode'])).strip().lower()
     cfg['rotation_mode'] = 'per_player' if rot_mode == 'per_player' else 'global'
     try:
@@ -566,6 +612,7 @@ def load_config_from_disk(create_if_missing: bool = True) -> Tuple[bool, str]:
 
         STATE.config = normalize_config(raw)
         sync_filter_flags_locked()
+        purge_fake_players_locked()
         enabled_pages = get_enabled_pages_locked()
         if enabled_pages:
             STATE.global_page_index = STATE.global_page_index % len(enabled_pages)
@@ -584,6 +631,7 @@ def save_sessions_locked() -> None:
             'sessions': STATE.player_sessions,
             'uuids': STATE.uuid_cache,
             'self_hidden': sorted(STATE.self_hidden_players),
+            'fake_players': sorted(STATE.fake_players),
             'gamerule_modified_by_plugin': STATE.gamerule_modified_by_plugin,
         }
         tmp = STATE.sessions_path + '.tmp'
@@ -607,6 +655,8 @@ def load_sessions_from_disk() -> None:
                 STATE.uuid_cache.update(data['uuids'])
             if isinstance(data.get('self_hidden'), list):
                 STATE.self_hidden_players.update(str(x).lower() for x in data['self_hidden'])
+            if isinstance(data.get('fake_players'), list):
+                STATE.fake_players.update(str(x).lower() for x in data['fake_players'])
             STATE.gamerule_modified_by_plugin = bool(data.get('gamerule_modified_by_plugin', False))
     except Exception:
         pass
@@ -687,7 +737,6 @@ def should_silence_op_feedback(server: PluginServerInterface) -> bool:
     if mode == 'always':
         return True
     props = read_server_properties(get_server_working_dir(server))
-    # 若 server.properties 已配置 broadcast-console-to-ops=false，玩家本就收不到控制台回显，无需修改 gamerule
     return props.get('broadcast-console-to-ops', 'true').lower() != 'false'
 
 
@@ -786,12 +835,16 @@ def read_vanilla_playtime_seconds(server: PluginServerInterface, player: str) ->
 
 
 def ensure_player_session(server: PluginServerInterface, player: str, reset_join: bool = False) -> None:
-    now = time.time()
     with STATE.lock:
+        if is_fake_player_locked(player):
+            return
         if not reset_join and player in STATE.player_sessions:
             return
+    now = time.time()
     base_total = read_vanilla_playtime_seconds(server, player)
     with STATE.lock:
+        if is_fake_player_locked(player):
+            return
         if reset_join or player not in STATE.player_sessions:
             STATE.player_sessions[player] = {
                 'join_time': now,
@@ -1108,7 +1161,7 @@ def sync_board(server: PluginServerInterface) -> None:
 
         hidden_count = len(STATE.online_players) - len(desired)
 
-        # Case 1: 全部在线玩家显示完全相同的内容 -> 直接使用全局 sidebar
+        # Case 1: 全部真实在线玩家显示完全相同的内容 -> 直接使用全局 sidebar
         if len(groups) == 1 and hidden_count == 0:
             (title_snbt, lines_snbt) = next(iter(groups.keys()))
             for color, obj in list(STATE.active_team_objs.items()):
@@ -1928,10 +1981,13 @@ def parse_list_output(server: PluginServerInterface, content: str) -> bool:
         return False
     names_raw = m.group(1).strip()
     names = [n.strip() for n in names_raw.split(',') if n.strip()] if names_raw else []
+    real_names: List[str] = []
     with STATE.lock:
         for p in names:
-            STATE.online_players.add(p)
-    for p in names:
+            if not is_fake_player_locked(p):
+                STATE.online_players.add(p)
+                real_names.append(p)
+    for p in real_names:
         ensure_player_session(server, p, reset_join=False)
     STATE.wake_event.set()
     return True
@@ -1967,6 +2023,7 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
         old = prev_module.STATE
         with old.lock:
             STATE.online_players = set(getattr(old, 'online_players', set()))
+            STATE.fake_players = set(getattr(old, 'fake_players', set()))
             STATE.player_sessions = copy.deepcopy(getattr(old, 'player_sessions', {}))
             STATE.uuid_cache = dict(getattr(old, 'uuid_cache', {}))
             STATE.self_hidden_players = set(getattr(old, 'self_hidden_players', set()))
@@ -2019,6 +2076,7 @@ def on_unload(server: PluginServerInterface) -> None:
 def on_server_startup(server: PluginServerInterface) -> None:
     with STATE.lock:
         STATE.online_players.clear()
+        STATE.fake_players.clear()
         STATE.player_sessions.clear()
         STATE.created_objs.clear()
         STATE.created_teams.clear()
@@ -2040,6 +2098,7 @@ def on_server_startup(server: PluginServerInterface) -> None:
 def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
     with STATE.lock:
         STATE.online_players.clear()
+        STATE.fake_players.clear()
         STATE.player_sessions.clear()
         STATE.created_objs.clear()
         STATE.created_teams.clear()
@@ -2053,25 +2112,53 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
 
 def on_player_joined(server: PluginServerInterface, player: str, info: Info) -> None:
     with STATE.lock:
+        if is_fake_player_locked(player):
+            return
         STATE.online_players.add(player)
     ensure_player_session(server, player, reset_join=True)
     STATE.wake_event.set()
 
 
 def on_player_left(server: PluginServerInterface, player: str) -> None:
+    changed = False
     with STATE.lock:
-        STATE.online_players.discard(player)
+        if player in STATE.online_players:
+            STATE.online_players.discard(player)
+            changed = True
+        STATE.fake_players.discard(player.lower())
         STATE.player_sessions.pop(player, None)
         STATE.player_team.pop(player, None)
         STATE.per_player_rot.pop(player.lower(), None)
         save_sessions_locked()
-    STATE.wake_event.set()
+    if changed:
+        STATE.wake_event.set()
+
+
+_LOGIN_ADDR_RE = re.compile(r'^([^\s\[]+)\[(.+?)\]\s+logged in with entity id \d+')
 
 
 def on_info(server: PluginServerInterface, info: Info) -> None:
     if info.is_user:
         return
     content = info.content or ''
+
+    # Detect Carpet fake players ([local] / [local:...]) vs real players ([/ip:port])
+    m_login = _LOGIN_ADDR_RE.match(content)
+    if m_login:
+        pname = m_login.group(1)
+        addr = m_login.group(2).strip().lower()
+        is_local = (addr == 'local' or addr.startswith('local:'))
+        with STATE.lock:
+            if is_local:
+                STATE.fake_players.add(pname.lower())
+                if STATE.config.get('ignore_fake_players', True):
+                    STATE.online_players.discard(pname)
+                    STATE.player_sessions.pop(pname, None)
+                    STATE.player_team.pop(pname, None)
+                    STATE.per_player_rot.pop(pname.lower(), None)
+            else:
+                STATE.fake_players.discard(pname.lower())
+            save_sessions_locked()
 
     m_uuid = re.search(r'UUID of player (\S+) is ([0-9a-fA-F-]+)', content)
     if m_uuid:
