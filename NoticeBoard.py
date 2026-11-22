@@ -24,7 +24,7 @@ except ImportError:
 
 PLUGIN_METADATA = {
     'id': 'notice_board',
-    'version': '1.0.1',
+    'version': '1.0.2',
     'name': 'NoticeBoard',
     'description': 'Vanilla 1.21.11 scoreboard sidebar announcement plugin with rotation, show/hide pages, targeting, colors, placeholders, and LuckPerms support',
     'author': 'MCDR',
@@ -76,6 +76,7 @@ MAX_SIDEBAR_LINES = 15
 DEFAULT_CONFIG: Dict[str, Any] = {
     'enabled': True,
     'suppress_console_output': True,
+    'silence_op_feedback': 'auto',  # 'auto', 'always', 'never'
     'rotation_mode': 'global',  # 'global' 或 'per_player'
     'refresh_interval': 1.0,
     'skip_empty_targets': True,
@@ -344,12 +345,19 @@ class PluginState:
         self.player_team: Dict[str, str] = {}
         self.last_overflow_warn: float = 0.0
 
+        # OP silence gamerule tracking
+        self.gamerule_checked: bool = False
+        self.gamerule_modified_by_plugin: bool = False
+        self.gamerule_lock = threading.Lock()
+        self.gamerule_pending: Optional[Dict[str, Any]] = None
+
         # Lock-free filter state (for InfoFilter on MCDR main thread)
         self.suppress_console: bool = True
         self.obj_prefix: str = 'nb_'
         self.team_prefix: str = '_nb_t_'
         self.filter_display_until: float = 0.0
         self.filter_team_leave_until: float = 0.0
+        self.filter_gamerule_until: float = 0.0
 
         # Async server info capture
         self.lp_lock = threading.Lock()
@@ -361,7 +369,7 @@ STATE = PluginState()
 
 
 # ============================================================================
-# MCDR InfoFilter: Hide Plugin's Scoreboard/Team Command Feedback
+# MCDR InfoFilter: Hide Plugin's Scoreboard/Team/Gamerule Command Feedback
 # ============================================================================
 
 _HOLDER_RE = re.compile(r'\bnb_(?:0[0-9]|1[0-4])\b')
@@ -396,6 +404,8 @@ def is_plugin_scoreboard_feedback(content: str, is_user: bool) -> bool:
     if now <= STATE.filter_display_until and _WINDOW_DISPLAY_RE.match(content):
         return True
     if now <= STATE.filter_team_leave_until and _WINDOW_TEAM_LEAVE_RE.match(content):
+        return True
+    if now <= STATE.filter_gamerule_until and 'log_admin_commands' in content:
         return True
     return False
 
@@ -468,6 +478,8 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg['enabled'] = bool(raw.get('enabled', cfg['enabled']))
     cfg['suppress_console_output'] = bool(raw.get('suppress_console_output', cfg['suppress_console_output']))
+    sil_op = str(raw.get('silence_op_feedback', cfg['silence_op_feedback'])).strip().lower()
+    cfg['silence_op_feedback'] = sil_op if sil_op in ('auto', 'always', 'never') else 'auto'
     rot_mode = str(raw.get('rotation_mode', cfg['rotation_mode'])).strip().lower()
     cfg['rotation_mode'] = 'per_player' if rot_mode == 'per_player' else 'global'
     try:
@@ -572,6 +584,7 @@ def save_sessions_locked() -> None:
             'sessions': STATE.player_sessions,
             'uuids': STATE.uuid_cache,
             'self_hidden': sorted(STATE.self_hidden_players),
+            'gamerule_modified_by_plugin': STATE.gamerule_modified_by_plugin,
         }
         tmp = STATE.sessions_path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -594,12 +607,13 @@ def load_sessions_from_disk() -> None:
                 STATE.uuid_cache.update(data['uuids'])
             if isinstance(data.get('self_hidden'), list):
                 STATE.self_hidden_players.update(str(x).lower() for x in data['self_hidden'])
+            STATE.gamerule_modified_by_plugin = bool(data.get('gamerule_modified_by_plugin', False))
     except Exception:
         pass
 
 
 # ============================================================================
-# World Stats & Playtime Resolution
+# Server Properties, Gamerule Silence & World Stats
 # ============================================================================
 
 def get_server_working_dir(server: PluginServerInterface) -> str:
@@ -610,22 +624,104 @@ def get_server_working_dir(server: PluginServerInterface) -> str:
         return 'server'
 
 
-def get_level_name(working_dir: str) -> str:
+def read_server_properties(working_dir: str) -> Dict[str, str]:
+    props: Dict[str, str] = {}
     props_path = os.path.join(working_dir, 'server.properties')
     if os.path.exists(props_path):
         try:
             with open(props_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith('#'):
+                    if not line or line.startswith('#') or '=' not in line:
                         continue
-                    if line.startswith('level-name='):
-                        val = line.split('=', 1)[1].strip()
-                        if val:
-                            return val
+                    k, v = line.split('=', 1)
+                    props[k.strip()] = v.strip()
         except OSError:
             pass
-    return 'world'
+    return props
+
+
+def get_level_name(working_dir: str) -> str:
+    return read_server_properties(working_dir).get('level-name') or 'world'
+
+
+_GAMERULE_VAL_RE = re.compile(r'(?:minecraft:)?log_admin_commands.*?(true|false)\b', re.I)
+
+
+def parse_gamerule_log_admin(text: str) -> Optional[bool]:
+    m = _GAMERULE_VAL_RE.search(text)
+    if m:
+        return m.group(1).lower() == 'true'
+    return None
+
+
+def query_gamerule_log_admin(server: PluginServerInterface, timeout: float = 1.5) -> Optional[bool]:
+    STATE.filter_gamerule_until = time.time() + 2.0
+    try:
+        if server.is_rcon_running():
+            out = server.rcon_query('gamerule minecraft:log_admin_commands')
+            if out is not None:
+                parsed = parse_gamerule_log_admin(out)
+                if parsed is not None:
+                    return parsed
+    except Exception:
+        pass
+
+    with STATE.gamerule_lock:
+        evt = threading.Event()
+        pending = {'value': None, 'event': evt}
+        STATE.gamerule_pending = pending
+        try:
+            server.execute('gamerule minecraft:log_admin_commands')
+            evt.wait(timeout=timeout)
+            return pending['value']
+        finally:
+            if STATE.gamerule_pending is pending:
+                STATE.gamerule_pending = None
+
+
+def should_silence_op_feedback(server: PluginServerInterface) -> bool:
+    mode = STATE.config.get('silence_op_feedback', 'auto')
+    if mode == 'never':
+        return False
+    if mode == 'always':
+        return True
+    props = read_server_properties(get_server_working_dir(server))
+    # 若 server.properties 已配置 broadcast-console-to-ops=false，玩家本就收不到控制台回显，无需修改 gamerule
+    return props.get('broadcast-console-to-ops', 'true').lower() != 'false'
+
+
+def ensure_op_silence(server: PluginServerInterface) -> None:
+    if not server.is_server_startup():
+        return
+    if not should_silence_op_feedback(server):
+        return
+    with STATE.lock:
+        if STATE.gamerule_checked:
+            return
+        STATE.gamerule_checked = True
+        already_modified = STATE.gamerule_modified_by_plugin
+
+    cur_val = query_gamerule_log_admin(server)
+    if cur_val is True:
+        STATE.filter_gamerule_until = time.time() + 2.0
+        server.execute('gamerule minecraft:log_admin_commands false')
+        with STATE.lock:
+            STATE.gamerule_modified_by_plugin = True
+            save_sessions_locked()
+    elif cur_val is False and already_modified:
+        pass
+
+
+def restore_op_silence(server: PluginServerInterface) -> None:
+    with STATE.lock:
+        should_restore = STATE.gamerule_modified_by_plugin
+        STATE.gamerule_modified_by_plugin = False
+        STATE.gamerule_checked = False
+        save_sessions_locked()
+    if should_restore and server.is_server_startup():
+        STATE.filter_gamerule_until = time.time() + 2.0
+        server.execute('gamerule minecraft:log_admin_commands true')
 
 
 def resolve_player_uuid(server: PluginServerInterface, player: str) -> Optional[str]:
@@ -966,6 +1062,13 @@ def sync_board(server: PluginServerInterface) -> None:
             return
         if not STATE.config.get('enabled', True):
             clear_all_display(server)
+            restore_op_silence(server)
+            return
+
+    ensure_op_silence(server)
+
+    with STATE.lock:
+        if not STATE.config.get('enabled', True) or not STATE.online_players:
             return
 
         now = time.time()
@@ -1323,6 +1426,8 @@ def cmd_info(source: CommandSource, context: CommandContext) -> None:
 def cmd_reload(source: CommandSource, context: CommandContext) -> None:
     ok, msg = load_config_from_disk(create_if_missing=True)
     if ok:
+        with STATE.lock:
+            STATE.gamerule_checked = False
         STATE.wake_event.set()
         source.reply(RText(f'[NoticeBoard] 重载成功: {msg}', RColor.green))
     else:
@@ -1334,6 +1439,8 @@ def cmd_set_enabled(enabled: bool):
     def inner(source: CommandSource, context: CommandContext) -> None:
         with STATE.lock:
             STATE.config['enabled'] = enabled
+            if enabled:
+                STATE.gamerule_checked = False
             save_config_locked()
         STATE.wake_event.set()
         source.reply(RText(f'公告栏已{"开启" if enabled else "关闭"}', RColor.green if enabled else RColor.yellow))
@@ -1859,12 +1966,13 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     if prev_module is not None and hasattr(prev_module, 'STATE'):
         old = prev_module.STATE
         with old.lock:
-            STATE.online_players = set(old.online_players)
-            STATE.player_sessions = copy.deepcopy(old.player_sessions)
-            STATE.uuid_cache = dict(old.uuid_cache)
-            STATE.self_hidden_players = set(old.self_hidden_players)
-            STATE.global_page_index = old.global_page_index
-            STATE.global_page_started_at = old.global_page_started_at
+            STATE.online_players = set(getattr(old, 'online_players', set()))
+            STATE.player_sessions = copy.deepcopy(getattr(old, 'player_sessions', {}))
+            STATE.uuid_cache = dict(getattr(old, 'uuid_cache', {}))
+            STATE.self_hidden_players = set(getattr(old, 'self_hidden_players', set()))
+            STATE.global_page_index = getattr(old, 'global_page_index', 0)
+            STATE.global_page_started_at = getattr(old, 'global_page_started_at', time.time())
+            STATE.gamerule_modified_by_plugin = bool(getattr(old, 'gamerule_modified_by_plugin', False))
     else:
         load_sessions_from_disk()
 
@@ -1905,6 +2013,7 @@ def on_unload(server: PluginServerInterface) -> None:
     with STATE.lock:
         save_sessions_locked()
         cleanup_minecraft_scoreboard(server)
+    restore_op_silence(server)
 
 
 def on_server_startup(server: PluginServerInterface) -> None:
@@ -1920,7 +2029,11 @@ def on_server_startup(server: PluginServerInterface) -> None:
         STATE.global_page_index = 0
         STATE.global_page_started_at = time.time()
         STATE.per_player_rot.clear()
+        STATE.gamerule_checked = False
+        was_modified = STATE.gamerule_modified_by_plugin
         save_sessions_locked()
+    if was_modified and (not STATE.config.get('enabled', True) or not should_silence_op_feedback(server)):
+        restore_op_silence(server)
     STATE.wake_event.set()
 
 
@@ -1934,6 +2047,7 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
         STATE.active_global_obj = None
         STATE.active_team_objs.clear()
         STATE.player_team.clear()
+        STATE.gamerule_checked = False
         save_sessions_locked()
 
 
@@ -1968,6 +2082,13 @@ def on_info(server: PluginServerInterface, info: Info) -> None:
     if time.time() <= STATE.list_pending_until and 'players online:' in content:
         if parse_list_output(server, content):
             STATE.list_pending_until = 0.0
+
+    gr_pending = STATE.gamerule_pending
+    if gr_pending is not None and not gr_pending['event'].is_set():
+        val = parse_gamerule_log_admin(content)
+        if val is not None:
+            gr_pending['value'] = val
+            gr_pending['event'].set()
 
     pending = STATE.lp_pending
     if pending is not None and not pending['event'].is_set():
